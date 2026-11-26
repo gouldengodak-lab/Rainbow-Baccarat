@@ -1,0 +1,15 @@
+{
+  "name": "rainbow-baccarat",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-25",
+  "assets": {
+    "directory": "./",
+    "binding": "ASSETS"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "LEADERBOARD_KV",
+      "id": "25659f8b97c3489b95aedf1e88514784"
+    }
+  ]
+}
