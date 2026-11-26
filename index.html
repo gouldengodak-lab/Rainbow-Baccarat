@@ -5,10 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Rainbow Baccarat — Official Casino Table</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- Firebase v10 Compat Scripts (Non-blocking, module-free) -->
-  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Inter:wght@500;600;700;800;900&family=JetBrains+Mono:wght@700;800&display=swap" rel="stylesheet">
@@ -1750,11 +1746,8 @@ const state = {
   firebaseReady: false
 };
 
-let db = null;
-let auth = null;
 let currentFirebaseUser = null;
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'rainbow-baccarat-official';
-const LEADERBOARD_COLLECTION = 'rainbow_baccarat_leaderboard';
+const LEADERBOARD_API_URL = '/api/leaderboard';
 const LOCAL_LEADERBOARD_CACHE_KEY = 'rb_global_leaderboard_cache_v2';
 
 function generateRandomHandle() {
@@ -1842,90 +1835,102 @@ function upsertLocalLeaderboardEntry() {
 }
 
 /**
- * Non-blocking background cloud synchronization to Firestore:
- * `/artifacts/{appId}/public/data/rainbow_baccarat_leaderboard/{playerId}`
+ * Non-blocking background cloud synchronization to Cloudflare Workers KV (`/api/leaderboard`)
  */
 function syncPlayerScoreToCloud() {
   upsertLocalLeaderboardEntry();
   updateMyLeaderboardSummaryUI();
   updateTopLeaderTicker();
 
-  if (!db || !currentFirebaseUser || !state.username) return;
-  const docId = currentFirebaseUser.uid;
-  if (!docId) return;
+  if (!state.username) return;
+  const docId = state.playerDocId || getOrCreateLocalPlayerId();
+  state.playerDocId = docId;
 
-  try {
-    const entryRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection(LEADERBOARD_COLLECTION).doc(docId);
-    entryRef.set({
+  const statusEl = document.getElementById('lb-sync-status');
+  const dotEl = document.getElementById('lb-sync-dot');
+
+  fetch(LEADERBOARD_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
       playerId: docId,
       username: state.username,
       peakBalance: Number(state.livePeakBalance.toFixed(2)),
       currentBalance: Number(state.liveEligibleBalance.toFixed(2)),
       netProfit: Number(state.liveNetProfit.toFixed(2)),
       bestHandWin: Number(state.liveBestHandWin.toFixed(2)),
-      handsPlayed: state.liveHandsCount,
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      clientUpdatedAt: Date.now()
-    }, { merge: true }).catch(function(err) {
-      console.warn('Background leaderboard sync deferred:', err);
-    });
-  } catch (e) {
-    console.warn('Firestore write skipped:', e);
-  }
-}
-
-function normalizeFirestoreEntry(docSnap) {
-  const data = docSnap.data();
-  if (!data || !data.username) return null;
-  let updatedMs = Number(data.clientUpdatedAt || 0);
-  if (!updatedMs && data.updatedAt) {
-    if (typeof data.updatedAt === 'number') updatedMs = data.updatedAt;
-    else if (typeof data.updatedAt.toMillis === 'function') updatedMs = data.updatedAt.toMillis();
-  }
-  return {
-    id: docSnap.id,
-    playerId: String(data.playerId || docSnap.id),
-    username: String(data.username),
-    peakBalance: Number(data.peakBalance != null ? data.peakBalance : 1000),
-    currentBalance: Number(data.currentBalance != null ? data.currentBalance : 1000),
-    netProfit: Number(data.netProfit != null ? data.netProfit : 0),
-    bestHandWin: Number(data.bestHandWin != null ? data.bestHandWin : 0),
-    handsPlayed: Number(data.handsPlayed != null ? data.handsPlayed : 0),
-    updatedAt: updatedMs || Date.now()
-  };
-}
-
-function manualRefreshLeaderboard() {
-  syncPlayerScoreToCloud();
-  if (!db || !currentFirebaseUser) {
-    renderLeaderboardModal();
-    return;
-  }
-  const statusEl = document.getElementById('lb-sync-status');
-  if (statusEl) statusEl.textContent = 'Refreshing Global Scores...';
-  try {
-    db.collection('artifacts').doc(appId).collection('public').doc('data').collection(LEADERBOARD_COLLECTION)
-      .get()
-      .then(function(snap) {
-        const entries = [];
-        snap.forEach(function(docSnap) {
-          const parsed = normalizeFirestoreEntry(docSnap);
-          if (parsed) entries.push(parsed);
-        });
+      handsPlayed: state.liveHandsCount
+    })
+  })
+    .then(function(res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(function(entries) {
+      if (Array.isArray(entries)) {
+        state.firebaseReady = true;
         state.leaderboardEntries = entries;
         upsertLocalLeaderboardEntry();
         saveCachedLeaderboard(state.leaderboardEntries);
         updateTopLeaderTicker();
         updateMyLeaderboardSummaryUI();
         renderLeaderboardModal();
-        if (statusEl) statusEl.textContent = '🌐 Global Cloud Sync Active • Live Table Rounds Only';
-      })
-      .catch(function() {
-        if (statusEl) statusEl.textContent = '🌐 Global Cloud Sync Active • Live Table Rounds Only';
-      });
-  } catch (e) {
-    if (statusEl) statusEl.textContent = '🌐 Global Cloud Sync Active • Live Table Rounds Only';
-  }
+      }
+      if (statusEl) statusEl.textContent = '🌐 Global KV Sync Active • Live Table Rounds Only';
+      if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+    })
+    .catch(function(err) {
+      console.warn('Background KV leaderboard sync deferred:', err);
+      if (statusEl) statusEl.textContent = 'Local Session Mode • Cached Leaderboard';
+      if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
+    });
+}
+
+function manualRefreshLeaderboard() {
+  const statusEl = document.getElementById('lb-sync-status');
+  const dotEl = document.getElementById('lb-sync-dot');
+  if (statusEl) statusEl.textContent = 'Refreshing Global Scores...';
+
+  fetch(LEADERBOARD_API_URL, { cache: 'no-store' })
+    .then(function(res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(function(entries) {
+      if (Array.isArray(entries)) {
+        state.firebaseReady = true;
+        const myId = state.playerDocId || getOrCreateLocalPlayerId();
+        const existingMe = entries.find(function(e) { return e.id === myId || e.playerId === myId; });
+        if (existingMe) {
+          if (Number(existingMe.peakBalance || 0) > state.livePeakBalance) {
+            state.livePeakBalance = Number(existingMe.peakBalance);
+          }
+          if (Number(existingMe.bestHandWin || 0) > state.liveBestHandWin) {
+            state.liveBestHandWin = Number(existingMe.bestHandWin);
+          }
+          if (Number(existingMe.handsPlayed || 0) > state.liveHandsCount) {
+            state.liveHandsCount = Number(existingMe.handsPlayed);
+            state.liveNetProfit = Number(existingMe.netProfit || 0);
+            state.liveEligibleBalance = Number(existingMe.currentBalance || 1000);
+          }
+        }
+        state.leaderboardEntries = entries;
+        upsertLocalLeaderboardEntry();
+        saveCachedLeaderboard(state.leaderboardEntries);
+        updateTopLeaderTicker();
+        updateMyLeaderboardSummaryUI();
+        renderLeaderboardModal();
+      }
+      if (statusEl) statusEl.textContent = '🌐 Global KV Sync Active • Live Table Rounds Only';
+      if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+      if (state.username) syncPlayerScoreToCloud();
+    })
+    .catch(function() {
+      syncPlayerScoreToCloud();
+      renderLeaderboardModal();
+      if (statusEl) statusEl.textContent = 'Local Session Mode • Cached Leaderboard';
+      if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
+    });
 }
 
 function initFirebaseLeaderboard() {
@@ -1937,105 +1942,68 @@ function initFirebaseLeaderboard() {
   const statusEl = document.getElementById('lb-sync-status');
   const dotEl = document.getElementById('lb-sync-dot');
 
-  try {
-    if (typeof firebase === 'undefined') {
-      if (statusEl) statusEl.textContent = 'Local Session Mode • Cached Leaderboard';
-      if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
-      return;
-    }
-
-    const rawConfig =
-      typeof __firebase_config !== 'undefined'
-        ? __firebase_config
-        : typeof window.__firebase_config !== 'undefined'
-        ? window.__firebase_config
-        : null;
-
-    if (!rawConfig) {
-      if (statusEl) statusEl.textContent = 'Local Session Mode • Cached Leaderboard';
-      if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
-      return;
-    }
-
-    const firebaseConfig = typeof rawConfig === 'string' ? JSON.parse(rawConfig) : rawConfig;
-    if (!firebase.apps.length) {
-      firebase.initializeApp(firebaseConfig);
-    }
-    auth = firebase.auth();
-    db = firebase.firestore();
-
-    let snapshotUnsub = null;
-
-    auth.onAuthStateChanged(function(user) {
-      if (!user) return;
-      currentFirebaseUser = user;
-      state.playerDocId = user.uid;
-      state.firebaseReady = true;
-
-      if (statusEl) statusEl.textContent = '🌐 Global Cloud Sync Active • Live Table Rounds Only';
+  fetch(LEADERBOARD_API_URL, { cache: 'no-store' })
+    .then(function(res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(function(entries) {
+      if (Array.isArray(entries)) {
+        state.firebaseReady = true;
+        const myId = state.playerDocId;
+        const existingMe = entries.find(function(e) { return e.id === myId || e.playerId === myId; });
+        if (existingMe) {
+          if (Number(existingMe.peakBalance || 0) > state.livePeakBalance) {
+            state.livePeakBalance = Number(existingMe.peakBalance);
+          }
+          if (Number(existingMe.bestHandWin || 0) > state.liveBestHandWin) {
+            state.liveBestHandWin = Number(existingMe.bestHandWin);
+          }
+          if (Number(existingMe.handsPlayed || 0) > state.liveHandsCount) {
+            state.liveHandsCount = Number(existingMe.handsPlayed);
+            state.liveNetProfit = Number(existingMe.netProfit || 0);
+            state.liveEligibleBalance = Number(existingMe.currentBalance || 1000);
+          }
+        }
+        state.leaderboardEntries = entries;
+        upsertLocalLeaderboardEntry();
+        saveCachedLeaderboard(state.leaderboardEntries);
+        updateTopLeaderTicker();
+        updateMyLeaderboardSummaryUI();
+        renderLeaderboardModal();
+      }
+      if (statusEl) statusEl.textContent = '🌐 Global KV Sync Active • Live Table Rounds Only';
       if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
 
       if (state.username) {
         syncPlayerScoreToCloud();
       }
-
-      if (snapshotUnsub) snapshotUnsub();
-      const colRef = db.collection('artifacts').doc(appId).collection('public').doc('data').collection(LEADERBOARD_COLLECTION);
-      snapshotUnsub = colRef.onSnapshot(
-        function(snapshot) {
-          const entries = [];
-          snapshot.forEach(function(docSnap) {
-            const parsed = normalizeFirestoreEntry(docSnap);
-            if (parsed) entries.push(parsed);
-          });
-
-          const myId = user.uid;
-          const existingMe = entries.find(function(e) { return e.id === myId; });
-          if (existingMe) {
-            if (existingMe.peakBalance > state.livePeakBalance) {
-              state.livePeakBalance = existingMe.peakBalance;
-            }
-            if (existingMe.bestHandWin > state.liveBestHandWin) {
-              state.liveBestHandWin = existingMe.bestHandWin;
-            }
-            if (existingMe.handsPlayed > state.liveHandsCount) {
-              state.liveHandsCount = existingMe.handsPlayed;
-              state.liveNetProfit = existingMe.netProfit;
-              state.liveEligibleBalance = existingMe.currentBalance;
-            }
-          }
-
-          state.leaderboardEntries = entries;
-          upsertLocalLeaderboardEntry();
-          saveCachedLeaderboard(state.leaderboardEntries);
-          updateTopLeaderTicker();
-          updateMyLeaderboardSummaryUI();
-          renderLeaderboardModal();
-        },
-        function(error) {
-          console.warn('Leaderboard onSnapshot warning:', error);
-          if (statusEl) statusEl.textContent = 'Cloud Reconnecting • Using Local Cache';
-          if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
-        }
-      );
+    })
+    .catch(function(err) {
+      console.warn('KV leaderboard init fallback:', err);
+      if (statusEl) statusEl.textContent = 'Local Session Mode • Cached Leaderboard';
+      if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
     });
 
-    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-      auth.signInWithCustomToken(__initial_auth_token).catch(function() {
-        auth.signInAnonymously().catch(function() {});
-      });
-    } else {
-      auth.signInAnonymously().catch(function(err) {
-        console.warn('Anonymous sign-in fallback:', err);
-        if (statusEl) statusEl.textContent = 'Local Session Mode • Cached Leaderboard';
-        if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
-      });
-    }
-  } catch (err) {
-    console.warn('Firebase init fallback:', err);
-    if (statusEl) statusEl.textContent = 'Local Session Mode • Cached Leaderboard';
-    if (dotEl) dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
-  }
+  // Periodic background refresh every 25s while active on page
+  setInterval(function() {
+    if (document.hidden) return;
+    fetch(LEADERBOARD_API_URL, { cache: 'no-store' })
+      .then(function(res) { return res.ok ? res.json() : null; })
+      .then(function(entries) {
+        if (!Array.isArray(entries)) return;
+        state.leaderboardEntries = entries;
+        upsertLocalLeaderboardEntry();
+        saveCachedLeaderboard(state.leaderboardEntries);
+        updateTopLeaderTicker();
+        updateMyLeaderboardSummaryUI();
+        const modal = document.getElementById('leaderboard-modal');
+        if (modal && !modal.classList.contains('hidden')) {
+          renderLeaderboardModal();
+        }
+      })
+      .catch(function() {});
+  }, 25000);
 }
 
 function getSortedLeaderboardEntries(sortKey) {
@@ -4314,6 +4282,7 @@ function initApp() {
     renderLeaderboardModal();
     leaderboardModal.classList.remove('hidden');
     leaderboardModal.classList.add('flex');
+    manualRefreshLeaderboard();
   };
   document.getElementById('btn-leaderboard').addEventListener('click', openLeaderboard);
   document.getElementById('hud-leader-ticker').addEventListener('click', openLeaderboard);
